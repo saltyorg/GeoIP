@@ -1,0 +1,223 @@
+name: Publish GeoLite.mmdb
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+  schedule:
+    - cron: "0 1 * * *"
+
+concurrency:
+  group: geolite-publish
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  KEEP_LATEST_RELEASES: "7"
+  KEEP_MIN_WORKFLOW_RUNS: "3"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download & extract GeoLite MMDBs (MaxMind Basic Auth, retries)
+        shell: bash
+        env:
+          MAXMIND_ACCOUNT_ID: ${{ secrets.MAXMIND_ACCOUNT_ID }}
+          MAXMIND_LICENSE_KEY: ${{ secrets.MAXMIND_LICENSE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${MAXMIND_ACCOUNT_ID:-}" || -z "${MAXMIND_LICENSE_KEY:-}" ]]; then
+            echo "Missing MAXMIND_ACCOUNT_ID or MAXMIND_LICENSE_KEY secrets."
+            exit 1
+          fi
+
+          retry() {
+            local n=0 max=6
+            until "$@"; do
+              n=$((n+1))
+              if (( n >= max )); then
+                echo "Command failed after ${n} attempts: $*" >&2
+                return 1
+              fi
+              sleep $((2 * n))
+            done
+          }
+
+          work="$(mktemp -d)"
+          out="$PWD/upload"
+          mkdir -p "$out"
+
+          fetch_extract_mmdb() {
+            local db="$1"     # e.g., GeoLite2-City
+            local suffix="$2" # tar.gz or zip
+
+            echo "Downloading ${db} (${suffix})..."
+            retry curl -fsSL \
+              --retry 8 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              --connect-timeout 10 \
+              --max-time 180 \
+              -u "${MAXMIND_ACCOUNT_ID}:${MAXMIND_LICENSE_KEY}" \
+              "https://download.maxmind.com/geoip/databases/${db}/download?suffix=${suffix}" \
+              -o "${work}/${db}.${suffix}"
+
+            if [[ "$suffix" == "tar.gz" ]]; then
+              tar -xzf "${work}/${db}.${suffix}" -C "$work"
+            else
+              unzip -q "${work}/${db}.${suffix}" -d "$work"
+            fi
+
+            # Prefer the expected filename if present; otherwise fall back to first .mmdb found.
+            local mmdb=""
+            mmdb="$(find "$work" -type f -name "${db}.mmdb" | head -n 1 || true)"
+            if [[ -z "$mmdb" ]]; then
+              mmdb="$(find "$work" -type f -name '*.mmdb' | head -n 1 || true)"
+            fi
+            if [[ -z "$mmdb" ]]; then
+              echo "No .mmdb found for ${db} after extraction." >&2
+              exit 1
+            fi
+
+            cp -v "$mmdb" "$out/${db}.mmdb"
+            rm -rf "$work"/*
+          }
+
+          # Use tar.gz for simpler extraction.
+          fetch_extract_mmdb "GeoLite2-ASN"     "tar.gz"
+          fetch_extract_mmdb "GeoLite2-City"    "tar.gz"
+          fetch_extract_mmdb "GeoLite2-Country" "tar.gz"
+
+          (cd "$out" && sha256sum *.mmdb > SHA256SUMS.txt)
+
+          TAG_NAME="$(date -u +'%Y.%m.%d')"
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+
+      - name: Create/Update GitHub Release and upload assets (retries)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local n=0 max=6
+            until "$@"; do
+              n=$((n+1))
+              if (( n >= max )); then
+                echo "Command failed after ${n} attempts: $*" >&2
+                return 1
+              fi
+              sleep $((2 * n))
+            done
+          }
+
+          tag="${TAG_NAME}"
+          title="GeoLite.mmdb ${TAG_NAME}"
+          notes="Automated GeoLite2 database build for ${TAG_NAME} (UTC)."
+
+          if retry gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag exists. Replacing assets..."
+          else
+            echo "Creating release $tag..."
+            retry gh release create "$tag" --title "$title" --notes "$notes"
+          fi
+
+          retry gh release upload "$tag" upload/*.mmdb upload/SHA256SUMS.txt --clobber
+
+      - name: Prune old releases and tags (keep latest N) - best effort
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local n=0 max=6
+            until "$@"; do
+              n=$((n+1))
+              if (( n >= max )); then
+                echo "Command failed after ${n} attempts: $*" >&2
+                return 1
+              fi
+              sleep $((2 * n))
+            done
+          }
+
+          keep="${KEEP_LATEST_RELEASES}"
+
+          if ! [[ "$keep" =~ ^[0-9]+$ ]] || [[ "$keep" -lt 1 ]]; then
+            echo "KEEP_LATEST_RELEASES must be a positive integer."
+            exit 1
+          fi
+
+          mapfile -t tags < <(retry gh release list --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName' || true)
+
+          echo "Found ${#tags[@]} releases."
+          if [[ "${#tags[@]}" -le "$keep" ]]; then
+            echo "Nothing to prune."
+            exit 0
+          fi
+
+          for ((i=keep; i<${#tags[@]}; i++)); do
+            old="${tags[$i]}"
+            echo "Deleting release+tag: $old"
+            retry gh release delete "$old" --yes --cleanup-tag
+          done
+
+      - name: Prune old workflow runs (optional) - best effort
+        if: env.KEEP_MIN_WORKFLOW_RUNS != '0'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local n=0 max=6
+            until "$@"; do
+              n=$((n+1))
+              if (( n >= max )); then
+                echo "Command failed after ${n} attempts: $*" >&2
+                return 1
+              fi
+              sleep $((2 * n))
+            done
+          }
+
+          keep="${KEEP_MIN_WORKFLOW_RUNS}"
+          if ! [[ "$keep" =~ ^[0-9]+$ ]] || [[ "$keep" -lt 1 ]]; then
+            echo "KEEP_MIN_WORKFLOW_RUNS must be a positive integer, or set to 0 to disable."
+            exit 1
+          fi
+
+          repo="${GITHUB_REPOSITORY}"
+          wf="${GITHUB_WORKFLOW}"
+
+          wf_id="$(retry gh api "repos/${repo}/actions/workflows" --jq ".workflows[] | select(.name==\"${wf}\") | .id" | head -n 1 || true)"
+          if [[ -z "$wf_id" ]]; then
+            echo "Could not resolve workflow id for ${wf}. Skipping."
+            exit 0
+          fi
+
+          mapfile -t run_ids < <(
+            retry gh api "repos/${repo}/actions/workflows/${wf_id}/runs?per_page=100" \
+              --jq '.workflow_runs | sort_by(.created_at) | reverse | .[].id'
+          )
+
+          if [[ "${#run_ids[@]}" -le "$keep" ]]; then
+            echo "Workflow runs <= keep (${#run_ids[@]} <= $keep). Nothing to prune."
+            exit 0
+          fi
+
+          for ((i=keep; i<${#run_ids[@]}; i++)); do
+            rid="${run_ids[$i]}"
+            echo "Deleting workflow run: $rid"
+            retry gh api -X DELETE "repos/${repo}/actions/runs/${rid}" >/dev/null
+          done
