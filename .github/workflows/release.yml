@@ -161,16 +161,36 @@ jobs:
             exit 1
           fi
 
-          mapfile -t tags < <(retry gh release list --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName' || true)
+          current="${TAG_NAME:-}"
+          if [[ -z "$current" ]]; then
+            echo "TAG_NAME is empty; refusing to prune to avoid deleting the wrong thing."
+            exit 0
+          fi
 
-          echo "Found ${#tags[@]} releases."
-          if [[ "${#tags[@]}" -le "$keep" ]]; then
+          # Deterministic: tags are YYYY.MM.DD so lexicographic sort works.
+          # Only consider tags that match that exact format.
+          mapfile -t tags < <(
+            retry gh release list --limit 200 --json tagName \
+              --jq '.[].tagName | select(test("^[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}$"))' \
+              | sort -r
+          )
+
+          echo "Found ${#tags[@]} releases (date-tagged). Current tag: $current"
+
+          if (( ${#tags[@]} <= keep )); then
             echo "Nothing to prune."
             exit 0
           fi
 
           for ((i=keep; i<${#tags[@]}; i++)); do
             old="${tags[$i]}"
+
+            # Guardrail: never delete the release/tag we just created in this run.
+            if [[ "$old" == "$current" ]]; then
+              echo "Skipping current tag: $old"
+              continue
+            fi
+
             echo "Deleting release+tag: $old"
             retry gh release delete "$old" --yes --cleanup-tag
           done
